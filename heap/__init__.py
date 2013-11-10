@@ -4,46 +4,93 @@ analyzing the heap.
 Currently only one heap implementation, that of glibc, is supported.
 """
 
+import _gdb as gdb
 import sys
+import threading
 
-import gdb
+from _heap import HeapDetectionError, WrongHeapVersionError, UnsupportedHeap
+from glibc import detect_glibc_heap
+from commands import activate_basic_commands
 
-from glibc import is_using_glibc_heap
-from commands import register_basic_commands
+# Always import any non-standard GDB helpers from _gdb
+from _gdb import watch_active_inferior
 
-#__all__ = ['categorize_heap']
+_heap_detectors = [detect_glibc_heap]
 
 # Sanity check that we have the minimum supported version. This is just a
 # precaution, I don't think GDB embedded any Python versions under 2.6
 assert sys.version_info[0:2] >= (2, 6)
 
-# Try to detect the heap implementation. Note that GDB can have multiple
-# and that in theory, each of the inferiors could have a different heap
-# implementation. This is a problem since we can only register one set of
-# commands. Currently this is dealt with by registering the commands for
-# the heap of the currently selected inferior, and simply disabling the
-# commands when an inferior running a different type of
-inferior_heap_map = dict.fromkeys(gdb.inferiors(), None)
+# GDB can have multiple inferiors and in theory each of these inferiors
+# might have a different heap implementation. As such, we have to keep a
+# different analyzer for each inferior, and try to be smart about swapping
+# between inferiors. This includes activating commands on a per-inferior
+# basis, which can be accomplished by simply registering the commands again
+# in the correct order.
 
 
 class AnalyzerState(object):
-    """Class to keep track of the current state of the overall package, such
-    as if the heap has changed, and which inferior the analyzer is working on.
+    """Class to keep track of the current state of the overall extension, such
+    as which inferior the analyzer is working on.
 
     For all intents and purposes, this class is a singleton, but not enforced.
+    This class also has basic thread-safety by coarse level, recursive locking.
 
     """
 
-    def __init__(self, inferior):
-        self.heap_analyzer = None
-        self.heap_inferior = inferior
+    def __init__(self):
+        self._lock = threading.RLock()
+        self.inferior_to_analyzer_map = dict.fromkeys(gdb.inferiors(), None)
 
-        self._current_frame = None
+        # Use a background thread to monitor if the user switches inferiors
+        background_function = lambda: watch_active_inferior(self.on_inferior_change,
+                                                            gdb.selected_inferior())
+        inferior_watcher = threading.Thread(target=background_function)
+        inferior_watcher.daemon = True
+        inferior_watcher.start()
 
-    def is_valid(self):
-        return self.current_frame == 44
+    def get_current_analyzer(self):
+        with self._lock:
+            inferior = gdb.selected_inferior()
 
-# XXX - We need an equivalent of 'selected_inferior' for older versions of GDB
+            # Use setdefault in case this is a new inferior we haven't seen
+            return self.inferior_to_analyzer_map.setdefault(inferior, None)
+
+    def detect_heap(self):
+        with self._lock:
+            inferior = gdb.selected_inferior()
+
+            # Assert that this inferior has not already been detected
+            assert self.inferior_to_analyzer_map[inferior] is None
+
+            heap_analyzer = UnsupportedHeap
+
+            for detector in _heap_detectors:
+                try:
+                    heap_analyzer = detector(inferior)
+                    break
+                except HeapDetectionError:
+                    pass  # Expected error
+                except WrongHeapVersionError, e:
+                    print "INFO: Unsupported heap version detected: {0}".format(e)
+                    break
+
+            self.inferior_to_analyzer_map[inferior] = heap_analyzer
+
+            return heap_analyzer
+
+    def on_inferior_change(self, new_inferior):
+        with self._lock:
+            # First wipe the active commands back to basics
+            activate_basic_commands(self)
+
+            # Check to see if an analyzer exists yet for this inferior
+            analyzer = self.inferior_to_analyzer_map.setdefault(new_inferior, None)
+
+            # If one does, activate the commands for it
+            if analyzer is not UnsupportedHeap and analyzer is not None:
+                analyzer.activate_commands()
+
 
 # Register the basic heap commands
-register_basic_commands(AnalyzerState(gdb.inferiors()[0]))
+activate_basic_commands(AnalyzerState())
